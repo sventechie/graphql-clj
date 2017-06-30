@@ -1,0 +1,65 @@
+^{:start [1 1 0], :end [8 1 300]}
+[^{:start [3 1 164], :end [7 2 299]}
+ {:tag :query-definition
+  :name ^{:start [3 7 170], :end [3 24 187]} WithDefaultValues
+  :selection-set
+  [^{:start [6 3 285], :end [6 15 297]}
+   {:tag :selection-field
+    :name ^{:start [6 3 285], :end [6 6 288]} dog
+    :selection-set
+    [^{:start [6 9 291], :end [6 13 295]}
+     {:tag :selection-field
+      :name ^{:start [6 9 291], :end [6 13 295]} name}]}]
+  :variable-definitions
+  [^{:start [4 3 191], :end [4 11 199]}
+   {:tag :variable-definition
+    :name ^{:start [4 4 192], :end [4 5 193]} a
+    :type
+    ^{:start [4 6 194], :end [4 9 197]}
+    {:tag :basic-type
+     :name ^{:start [4 6 194], :end [4 9 197]} Int}
+    :default-value
+    ^{:start [4 10 198], :end [4 11 199]}
+    {:tag :int-value
+     :image "1"
+     :value 1}}
+   ^{:start [5 3 203], :end [5 24 224]}
+   {:tag :variable-definition
+    :name ^{:start [5 5 205], :end [5 6 206]} b
+    :type
+    ^{:start [5 9 209], :end [5 17 217]}
+    {:tag :basic-type
+     :name ^{:start [5 9 209], :end [5 15 215]} String
+     :required true}
+    :default-value
+    ^{:start [5 20 220], :end [5 24 224]}
+    {:tag :string-value
+     :image "\"ok\""
+     :value "ok"}}
+   ^{:start [5 24 224], :end [5 79 279]}
+   {:tag :variable-definition
+    :name ^{:start [5 25 225], :end [5 26 226]} c
+    :type
+    ^{:start [5 28 228], :end [5 40 240]}
+    {:tag :basic-type
+     :name ^{:start [5 28 228], :end [5 40 240]} ComplexInput}
+    :default-value
+    ^{:start [5 43 243], :end [5 79 279]}
+    {:tag :object-value
+     :fields
+     [^{:start [5 45 245], :end [5 64 264]}
+      {:tag :object-field
+       :name ^{:start [5 45 245], :end [5 58 258]} requiredField
+       :value
+       ^{:start [5 60 260], :end [5 64 264]}
+       {:tag :boolean-value
+        :image "true"
+        :value true}}
+      ^{:start [5 66 266], :end [5 77 277]}
+      {:tag :object-field
+       :name ^{:start [5 66 266], :end [5 74 274]} intField
+       :value
+       ^{:start [5 76 276], :end [5 77 277]}
+       {:tag :int-value
+        :image "3"
+        :value 3}}]}}]}]

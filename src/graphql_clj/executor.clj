@@ -1,276 +1,303 @@
 (ns graphql-clj.executor
-  (:require [graphql-clj.parser :as parser]
-            [graphql-clj.type :as type]
-            [taoensso.timbre :as log]))
+  (:require [graphql-clj.schema-validator :as sv]
+            [graphql-clj.query-validator :as qv]
+            [graphql-clj.resolver :as resolver]
+            [graphql-clj.error :as gerror]
+            [clojure.set :as set]
+            [clojure.string :as str]))
 
-(defn get-selection-arguments
-  [selection]
-  (log/debug "get-selection-arguments: " selection)
-  (let [arguments (get-in (second selection) [:field :arguments])]
-    (log/debug "get-selection-arguments: arguments: " arguments)
-    arguments))
+(defn- error?
+  [error]
+  (= clojure.lang.ExceptionInfo (type error)))
 
-(defn get-selection-name
-  [selection]
-  (log/debug "get-selection-name: " selection)
-  (let [name (or (get-in (second selection) [:field :name])
-                 (get-in (second selection) [:fragment-spread :fragment-name]))]
-    (log/debug "get-selection-name: name: " name)
-    (if name
-      name
-      (throw (ex-info (format "Selection Name is null for selection: %s." selection)
-                      {:selection selection})))))
+(defn format-errors
+  [errors]
+  (->> errors
+       (map (fn format-error [error]
+              (let [err (ex-data error)
+                    locations (:locations err)
+                    path (:path err)]
+                (-> {:message (.getMessage error)}
+                    (cond-> locations (assoc :locations locations))
+                    (cond-> path (assoc :path path))))))
+       distinct))
 
-(defn get-selection-type [selection]
-  (log/debug "get-selection-type: selection: " selection)
-  (let [opts (second selection)]
-    (cond
-      (:field opts) :field
-      (:fragment-spread opts) :fragment-spread
-      :default (throw (ex-info (format "Selection Type is not handled for selection: %s." selection)
-                               {:type (:field opts)
-                                :opts opts})))))
+(defn- cleanup-errors
+  [result]
+  (if (seq (:errors result))
+    (update result :errors format-errors)
+    result))
 
-(defn get-field-selection-set [selection]
-  (log/debug "*** get-field-selection-set: selection: " selection)
-  (let [opts (second selection)
-        selection-set (get-in opts [:field :selection-set])]
-    (log/debug "field: " opts)
-    (log/debug "get-field-selection-set: selection-set: " selection-set)
-    selection-set))
+(defn- rollup-errors
+  [errors error]
+  (if-let [nested-errors (:errors (ex-data error))]
+    (concat errors nested-errors)
+    (conj errors error)))
 
-(defn expand-fragment [fragment-name fragments]
-  (log/debug "expand-fragment: " fragment-name)
-  (log/debug "expand-fragment: fragments: " fragments)
-  (let [fragment (get fragments fragment-name)
-        selection-set (:selection-set fragment)]
-    (if fragment
-      selection-set
-      (throw (ex-info (format "expand-fragment: cannot find fragment(%s)." fragment-name)
-                      {:fragment-name fragment-name
-                       :fragments fragments})))))
+(declare collect-fields)
 
-(defn collect-selection-fn
-  [fragments]
-  (fn [col selection]
-    (log/debug "collect-selection-fn: " selection)
-    (log/debug "collect-selection-fn: col: " col)
-    (log/debug "collect-selection-fn: fragments: " fragments)
-    (let [selection-type (get-selection-type selection)
-          selection-name (get-selection-name selection)]
-      (log/debug "selection-type: " selection-type)
-      (case selection-type
-        :field (conj col selection)
-        ;; (throw (ex-info "TODO: add suport for selection type :fragment-spread") {})
-        :fragment-spread (into col (expand-fragment selection-name fragments))
-        (throw (ex-info (format "selection type(%s) is not supported yet." selection-type)
-                        {:selection-type selection-type
-                         :selection selection}))))))
+(defn- does-fragment-type-apply?
+  "Implementation of DoesFragmentTypeApply(objectType, fragmentType)"
+  [object-type fragment-type]
+  true)
 
-(defn collect-fields
-  "CollectFields(objectType, selectionSet, visitedFragments)"
-  [selection-set fragments]
-  (log/debug "collect-fields: selection-set" selection-set)
-  (log/debug "collect-fields: fragments: " fragments)
-  (reduce (collect-selection-fn fragments) [] selection-set))
+(defn collect-field-fn
+  [type state]
+  (fn [result selection]
+    ;; (prn "collect-field-fn: selection:" selection)
+    (case (:tag selection)
+      :selection-field (update result (or (:alias selection)
+                                          (:name selection)) conj selection)
+      :inline-fragment (when (does-fragment-type-apply? type (:on selection))
+                         (let [fragment-grouped-field-set (collect-fields (:type selection) (:selection-set selection) {} state)]
+                           (reduce (fn [result [name selection]]
+                                     ;; (println "result:" result "name:" name "selection:" selection)
+                                     (update result name concat selection))
+                                   result
+                                   fragment-grouped-field-set))))))
 
-(comment ; Type kind
-  :SCALAR
-  :OBJECT
-  :INTERFACE
-  :UNION
-  :ENUM
-  :INPUT_OBJECT
-  :LIST
-  :NOT_NULL)
+(defn- collect-fields [type selection-set fields state]
+  (reduce (collect-field-fn type state) fields selection-set))
 
-;; (defn default-resolve-fn
-;;   [field-name]
-;;   (fn [& args]
-;;     (let [context (first args)
-;;           parent (second args)]
-;;       (get parent (keyword field-name)))))
+(defn- get-field-type
+  [schema parent-type-name field-name]
+  (assert schema "Schema is nil!")
+  (assert parent-type-name (format "parent-type-name is nil for field: %s!" parent-type-name))
+  (assert field-name "field-name is nil!")
+  (let [parent-type (get-in schema [:type-map parent-type-name])
+        field-map (:field-map parent-type)
+        field (get field-map field-name)
+        field-type-name (get-in field [:type :name])
+        field-type (get-in schema [:type-map field-type-name])]
+    (assert parent-type (format "Could not found parent-type for type name: %s." parent-type-name))
+    (case (get-in field [:type :tag])
+      :basic-type (get-in schema [:type-map field-type-name])
+      :list-type (:type field)
+      (gerror/throw-error (format "Unhandled field type: %s (name = %s)." field field-name)))))
 
-;; (defn get-field-type-from-object-type
-;;   "FIXME"
-;;   [schema resolver-fn object-type field-selection]
-;;   (log/debug (format "get-field-type-from-object-type: object-type: %s." object-type))
-;;   (log/debug (format "get-field-type-from-object-type: field-selection: %s." field-selection))
-;;   (let [field-name (get-selection-name field-selection)
-;;         _ (log/debug "field-name: " field-name)
-;;         _ (log/debug "object: " (get-in object-type [:fields]))
-;;         type (get-in object-type [:fields (keyword field-name) :type])]
-;;     (cond
-;;       (map? type) type
-;;       (keyword? type) (type/get-type-in-schema type)
-;;       (nil? type) (throw (ex-info (format "Cannot find field type (%s) in object(%s)." field-name object-type) {})))))
+(defn- get-field-def
+  [schema parent-type-name field-name]
+  (assert schema "Schema is nil!")
+  (assert parent-type-name (format "parent-type-name is nil for field: %s!" parent-type-name))
+  (assert field-name "field-name is nil!")
+  (let [parent-type (get-in schema [:type-map parent-type-name])
+        field-map (:field-map parent-type)]
+    (get field-map field-name)))
 
-(defn resolve-field-on-object
-  "FIXME"
-  [context schema resolver-fn parent-type-name parent-object field-entry]
-  (log/debug "resolve-field-on-object: ")
-  (log/debug "resolve-field-on-object: parent-type-name: " parent-type-name)
-  (log/debug "resolve-field-on-object: parent-object: " parent-object)
-  (log/debug "resolve-field-on-object: field-entry: " field-entry)
-  (let [field-name (get-selection-name field-entry)
-        arguments (get-selection-arguments field-entry)
-        resolve-fn (resolver-fn parent-type-name field-name)]
-    (log/debug "resolve-field-on-object: arguments: " arguments)
-    (if arguments
-      (resolve-fn context parent-object arguments)
-      (resolve-fn context parent-object))))
+(defn arg-fn
+  [default-args vars]
+  (fn [argument]
+    [(str (:name argument))
+     (or (get-in argument [:value :value])
+         (case (get-in argument [:value :tag])
+           :variable-reference (do (assert (get-in argument [:value :name]) "No name for variable reference!")
+                                   (get vars (str (get-in argument [:value :name]))))
+           :list-value (let [values (get-in argument [:value :values])]
+                         (assert values "No values for list type argument!")
+                         (map :value values)))
+         (get default-args (str (:name argument))))]))
 
-(defn merge-selection-sets
-  [selections]
-  (let [sets (reduce (fn [col selection]
-                       (log/debug (format "merge-selection-sets: col: %s, selection: %s." col selection))
-                       (let [field (:field (second selection))]
-                         (log/debug "merge-selection-sets: field-selection-set: " field)
-                         (if field
-                           (into col field)
-                           col)))
-                     [] selections)]
-    (log/debug "merge-selection-sets: sets: " sets)
-    sets))
-
-(defn is-enum-field-type?
-  [field-type-meta]
-  (= :ENUM (:kind field-type-meta)))
-
-(defn is-scalar-field-type?
-  [field-type-meta]
-  (= :SCALAR (:kind field-type-meta)))
-
-(defn is-object-field-type?
-  [field-type-meta]
-  (= :OBJECT (:kind field-type-meta)))
-
-(defn is-interface-field-type?
-  [field-type-meta]
-  (= :INTERFACE (:kind field-type-meta)))
-
-(defn is-union-field-type?
-  [field-type-meta]
-  (= :UNION (:kind field-type-meta)))
-
-(defn is-list-field-type?
-  [field-type-meta]
-  (= :LIST (:kind field-type-meta)))
-
-(defn is-not-null-type?
-  [field-type-meta]
-  (= :NOT_NULL (:kind field-type-meta)))
-
-;; (defn get-field-inner-type
-;;   [field-type-meta]
-;;   (get field-type-meta ))
+(defn args-fn [arguments default-arguments vars]
+  (let [default-args (->> default-arguments
+                          (filter (fn [argument]
+                                    (if (get-in argument [:default-value :value])
+                                      true)))
+                          (map (fn [argument]
+                                 [(str (:name argument))
+                                  (get-in argument [:default-value :value])]))
+                          (into {}))
+        args (->> arguments
+                  (map (arg-fn default-args vars))
+                  (into {}))]
+    (merge default-args args)))
 
 (declare execute-fields)
 
-(defn complete-value
-  [context schema resolver-fn field-type result sub-selection-set fragments]
-  (log/debug "*** complete-value: context: " context)
-  (log/debug "field-type: " field-type)
-  (log/debug "result: " result)
-  (log/debug "sub-selection-set: " sub-selection-set)
-  (log/debug "complete-value: fragments: " fragments)
-  ;;; TODO
-  ;; (if (and (not nullable?)
-  ;;          (nil? resolved-object))
-  ;;   (throw ""))
-  ;; FIXME
-  (if result
+(defn- resolve-field-value
+  "6.4.2 Value Resolution
+
+  While nearly all of GraphQL execution can be described generically,
+  ultimately the internal system exposing the GraphQL interface must
+  provide values. This is exposed via ResolveFieldValue, which
+  produces a value for a given field on a type for a real value."
+  [{:keys [resolver-fn name arguments] :as field}
+   field-def
+   {:keys [context resolver variables] :as state}
+   parent-type-name parent-value]
+  (let [field-name (:name field)
+        resolver (or resolver-fn
+                     (resolver (str parent-type-name) (str name)))
+        default-arguments (:arguments field-def)
+        final-args (args-fn arguments default-arguments variables)]
+    (resolver context parent-value final-args)))
+
+(defn- complete-value
+  "6.4.3 Value Completion
+
+  After resolving the value for a field, it is completed by ensuring
+  it adheres to the expected return type. If the return type is
+  another Object type, then the field execution process continues
+  recursively."
+  [{:keys [selection-set name resolved-type] :as field} field-type {:keys [schema] :as state} result]
+  ;; (prn "complete-value field:" field)
+  ;; (prn "complete-value field-type:" field-type)
+  ;; (prn "complete-value result:" result)
+  (if (and (:required resolved-type) (nil? result))
+    (ex-info (format "NOT_NULL field \"%s\" assigned a null value." name) {})
+    (let [type-name (:name field-type)
+          tag (:tag field-type)
+          inner-type (:inner-type field-type)]
+      (when result
+        (cond
+          (#{:scalar-definition :enum-definition} tag) result
+          (#{:type-definition :interface-definition} tag) (if (seq selection-set)
+                                      (let [fields (collect-fields field-type selection-set {} state)
+                                            result (execute-fields fields state type-name result)]
+                                        (if (:errors result)
+                                          (ex-info (format "Execution errors") {:errors (:errors result)
+                                                                                :data (:data result)})
+                                          (:data result)))
+                                      (ex-info (format "Object Field(%s) has no selection." name) {:name name}))
+          (#{:basic-type} tag) (let [unwrapped-type (get-in schema [:type-map type-name])]
+                                 (complete-value (assoc field :type unwrapped-type) unwrapped-type state result))
+          (#{:list-type} tag) (do
+                                (let [list-result (map #(complete-value {:selection-set selection-set
+                                                                         :name name
+                                                                         :type inner-type
+                                                                         :required (:required resolved-type)} inner-type state %) result)
+                                      errors (filter error? list-result)
+                                      data (filter #(not (error? %)) list-result)]
+                                  (if (seq errors)
+                                    (ex-info (format "Executing errors") {:errors errors
+                                                                          :data data})
+                                    data)))
+          :else (gerror/throw-error (format "Unhandled field(%s) type: %s%n resolved-type: %s%n field:%s%n" name field-type resolved-type field)))))))
+
+(defn- execute-field
+  "Implement 6.4 Executing Field
+
+  Each field requested in the grouped field set that is defined on the
+  selected objectType will result in an entry in the response
+  map. Field execution first coerces any provided argument values,
+  then resolves a value for the field, and finally completes that
+  value either by recursively executing another selection set or
+  coercing a scalar value."
+  [parent-type-name parent-value fields field-type field-def state]
+  (let [field (first fields)
+        resolved-value (resolve-field-value field field-def state parent-type-name parent-value)]
+    (complete-value field field-type state resolved-value)))
+
+(defn- execute-fields
+  "Implements the 'Executing selection sets' section of the spec for 'read' mode."
+  [fields state parent-type-name parent-value]
+  ;; (prn "execute-fields: fields:" fields)
+  (reduce (fn execute-fields-field [{:keys [errors data] :as result} [response-key response-fields]]
+            ;; (prn "execute-fields-field:" response-key)
+            ;; (prn "parent-type-name:" parent-type-name)
+            (let [field-name (:name (first response-fields))
+                  schema (:schema state)
+                  field-type (get-field-type schema parent-type-name field-name)
+                  field-def (get-field-def schema parent-type-name field-name)
+                  response-value (execute-field parent-type-name parent-value response-fields field-type field-def state)]
+              (if (not (error? response-value))
+                (update result :data assoc (str response-key) response-value)
+                {:errors (rollup-errors (:errors result) response-value)
+                 :data (assoc (:data result) (str response-key) (:data (ex-data response-value)))})))
+          {}
+          fields))
+
+(defn- guard-missing-vars [variable-definitions vars]
+  (let [required-var-names (->> (remove :default-value variable-definitions) (map :name) (map str) set)
+        default-vars (->> (filter :default-value variable-definitions)
+                          (map (fn [var-def]
+                                 [(str (:name var-def))
+                                  (get-in var-def [:default-value :value])]))
+                          (into {}))
+        input-var-names    (set (map key vars))
+        missing-var-names  (set/difference required-var-names input-var-names)
+        variables (merge default-vars vars)]
+    {:errors (map (fn erorr-msg [name] (ex-info (format "Missing input variables (%s)." name) {})) missing-var-names)
+     :variables variables}))
+
+(defn- get-operation-root-type
+  "Extracts the root type of the operation from the schema."
+  [{:keys [tag] :as operation} {:keys [schema] :as state}]
+  ;; (prn "schema:" schema)
+  (case tag
+    :query-definition (get-in schema [:roots :query])
+    :selection-set (get-in schema [:roots :query])
+    :mutation (get-in schema [:roots :mutation])
+    {:errors [{:message "Can only execute queries, mutations and subscriptions"}]}))
+
+(defn- execute-operation
+  [{:keys [tag selection-set variable-definitions] :as operation} {:keys [variables schema] :as state}]
+  (let [validation-result (guard-missing-vars variable-definitions variables)
+        state-with-variables (assoc state :variables (:variables validation-result))
+        root-type (get-operation-root-type operation state-with-variables)
+        fields (collect-fields root-type selection-set {} state-with-variables)]
+    ;; (prn "execute-operation: root-type:" root-type)
+    (assert root-type "root-type is nil!")
+    (if (seq (:errors validation-result))
+      {:errors (:errors validation-result)}
+      (case tag
+        :query-definition (execute-fields fields state-with-variables root-type :query-root-value)
+        ;; anonymous default query
+        :selection-set (execute-fields fields state-with-variables root-type :query-root-value)
+        ;; TODO: Execute fields serially
+        :mutation (execute-fields fields state-with-variables root-type :mutation-root-value)
+        {:errors [{:message "Can only execute queries, mutations and subscriptions"}]}))))
+
+(defn- execute-document
+  [document state operation-name]
+  ;; FIXME: Should only execute one statement per request, need
+  ;; additional paramter to specify which statement will be
+  ;; executed. Current implementation will merge result from multiple
+  ;; statements.
+  ;; (println "document:" document)
+  (let [operations (if operation-name
+                     (filter (fn [op]
+                               (= (str (:name op)) operation-name)) document)
+                     document)
+        operation (first operations)
+        operation-count (count operations)]
     (cond
-      (is-scalar-field-type? field-type) result
-      (is-enum-field-type? field-type) result
-      (is-object-field-type? field-type) (execute-fields context schema resolver-fn field-type result sub-selection-set fragments)
-      (is-list-field-type? field-type) (map #(execute-fields context schema resolver-fn (type/get-inner-type schema field-type) % sub-selection-set fragments) result)
-      (is-not-null-type? field-type) (let [not-null-result (complete-value context schema resolver-fn (type/get-inner-type schema field-type) result sub-selection-set fragments)]
-                                       (if not-null-result
-                                         not-null-result
-                                         (throw (ex-info (format "NOT_NULL type %s returns null." field-type {:field-type field-type})))))
-      :else (throw (ex-info (format "Unhandled field type %s." field-type) {:field-type field-type})))))
+      (= 1 operation-count) (-> (execute-operation operation state)
+                                (cleanup-errors))
+      (< operation-count 1) {:errors [{:message "No operation provided in query document."}]}
+      (> operation-count 1) {:errors [{:message "Must provide operation name if query contains multiple operations."}]})))
 
-(defn get-field-entry [context schema resolver-fn parent-type parent-object field-entry fragments]
-  (log/debug "*** get-field-entry: field-entry: " field-entry)
-  (log/debug "get-field-entry: fragments: " fragments)
-  (log/debug "get-field-entry: parent-object: " parent-object)
-  (log/debug "get-field-entry: parent-type: " parent-type)
-  (let [response-key (get-selection-name field-entry)
-        ;; field-type (get-field-type-from-object-type schema resolver-fn parent-type first-field-selection)
-        parent-type-name (:name parent-type)
-        field-type (type/get-field-type schema parent-type-name response-key)]
-    (log/debug "get-field-entry: field-type: " field-type)
-    (if (not (nil? field-type))
-      (let [resolved-object (resolve-field-on-object context schema resolver-fn parent-type-name parent-object field-entry)
-            field-selection-set (get-field-selection-set field-entry)
-            fields (collect-fields field-selection-set fragments)]
-        (log/debug "get-field-entry: fields: " fields)
-        (log/debug "get-field-entry: resolved-object: " resolved-object)
-        (if (nil? resolved-object) ; when field is not-null field, resolved-object might be nil.
-          [response-key nil] ; If resolvedObject is null, return
-                             ; tuple(responseKey, null), indicating
-                             ; that an entry exists in the result map
-                             ; whose value is null.
-          (let [;; sub-selection-set (merge-selection-sets field-selection-set)
-                response-value (complete-value context schema resolver-fn field-type resolved-object fields fragments)]
-            (log/debug "get-field-entry: response-value: " response-value)
-            [response-key response-value])))
-      (log/debug "WARNING: field-type is nil!"))))
+;; Public API
 
-(defn execute-fields
-  [context schema resolver-fn parent-type root-value fields fragments]
-  (log/debug "*** execute-fields")
-  (log/debug "execute-fields: parent-type: " parent-type)
-  (log/debug "execute-fields: root-value: " root-value)
-  (log/debug "execute-fields: fields: " fields)
-  (log/debug "execute-fields: fragments: " fragments)
-  (into {} (map (fn [field]
-                  (let [response-key (get-selection-name field)
-                        ;; field-type (get-field-type-from-object-type parent-type field)
-                        ;; resolved-object (resolve-field-on-object field-type root-value field)
-                        field-entry (get-field-entry context schema resolver-fn parent-type root-value field fragments)]
-                    field-entry))
-                fields)))
-
-(defn execute-query [context schema resolver-fn query fragments]
-  (let [selection-set (:selection-set query)
-        _ (log/debug "fragments: " fragments)
-        object-type (type/get-root-query-type schema)
-        fields (collect-fields selection-set fragments)]
-    (execute-fields context schema resolver-fn object-type :root fields fragments)))
-
-(defn execute-definition
-  [context schema resolver-fn definition fragments]
-  (log/debug "*** execute-definition: " definition)
-  (let [type (get-in definition [:operation-type :type])]
-    (log/debug "*** execute-definition: fragments: " fragments)
-    (case type
-      "query" (execute-query context schema resolver-fn definition fragments)
-      (throw (ex-info (format "Unhandled operation root type: %s." definition) {})))))
+(defn execute-validated-document
+  ([context schema resolver-fn [statement-errors document] variables operation-name]
+   (if (seq statement-errors)
+     {:errors statement-errors}
+     (execute-document document
+                       {:variables (clojure.walk/stringify-keys variables)
+                        :context context
+                        :schema schema
+                        :resolver (resolver/create-resolver-fn schema resolver-fn)}
+                       operation-name)))
+  ([context validated-schema resolver-fn validated-document]
+   (execute-validated-document context validated-schema resolver-fn validated-document nil nil))
+  ([context validated-schema resolver-fn validated-document variables]
+   (execute-validated-document context validated-schema resolver-fn validated-document variables nil)))
 
 (defn execute
-  [context schema resolver-fn document]
-  (let [operation-definitions (:operation-definitions document)
-        fragments (:fragments document)]
-    (if (empty? operation-definitions)
-      (throw (ex-info (format "Document is invalid (%s)." document) {}))
-      {:data (into {} (map (fn [definition]
-                             (execute-definition context schema resolver-fn definition fragments))
-                           operation-definitions))})))
+  ([context string-or-validated-schema resolver-fn string-or-validated-document variables operation-name]
+   (let [validated-schema (if (string? string-or-validated-schema)
+                            (sv/validate-schema string-or-validated-schema)
+                            string-or-validated-schema)
+         validated-document (if (string? string-or-validated-document)
+                              (try
+                                (qv/validate-query validated-schema string-or-validated-document)
+                                (catch Exception e
+                                  [(:errors (ex-data e)) nil]))
+                              string-or-validated-document)]
+     (execute-validated-document context validated-schema resolver-fn validated-document variables operation-name)))
+  ([context string-or-validated-schema resolver-fn string-or-validated-document variables]
+   (execute context string-or-validated-schema resolver-fn string-or-validated-document variables nil))
+  ([context string-or-validated-schema resolver-fn string-or-validated-document]
+   (execute context string-or-validated-schema resolver-fn string-or-validated-document nil nil)))
 
-(comment
-  (execute nil (parser/transform (parser/parse "query {user {id}}")) (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  (execute nil (parser/transform (parser/parse "query {user {id name}}")) (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  (execute nil (parser/transform (parser/parse "query {user {id name profilePic {url}}}")) (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  (execute nil (parser/transform (parser/parse "query {user {id name friends {name}}}")) (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  (execute nil (parser/transform (parser/parse "query {user { ...userFields friends {name}}} fragment userFields on UserType {id name}")) (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  (execute nil (parser/transform (parser/parse "{
-  __schema {
-    types {
-      name
-    }
-  }
-}"))
-           (graphql-clj.type/create-type-meta-fn graphql-clj.type/demo-schema))
-  )
+

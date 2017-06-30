@@ -1,233 +1,390 @@
 (ns graphql-clj.parser
   (:require [instaparse.core :as insta]
-            [clojure.java.io :as io]
-            [taoensso.timbre :as log]
-            [graphql-clj.type :as type]))
+            [clojure.set :as set]
+            [clojure.string :as str]
+            [clojure.pprint :refer [pprint] :as pp])
+  (:import [graphql_clj Parser ParseException]))
 
-(log/merge-config! {:level :info
-                    :appenders {:println {:async? false}}})
+(defn- unescape
+  "Unescapes a string's escaped values according to the graphql spec."
+  [str]
+  (let [^java.util.regex.Matcher m (re-matcher #"\\(?:u([0-9A-Fa-f]{4})|.)" str)]
+    (if-not (.find m)
+      str
+      (loop [buf (StringBuffer.)]
+        ;; we could pass in the unescaped char as a replacement, but
+        ;; then we have to convert it to string and quoteReplacement.
+        ;; Its easier jsut to append "", the directly append the char
+        ;; to the builder.
+        (.appendReplacement m buf "")
+        (->> (let [ch (.charAt str (inc (.start m)))]
+               (case ch
+                 \u (-> (.group m 1) (Integer/parseInt 16) char)
+                 \n \newline
+                 \r \return
+                 \t \tab
+                 \b \backspace
+                 \f \formfeed
+                 ch))
+             (.append buf))
+        (if (.find m)
+          (recur buf)
+          (.. m (appendTail buf) toString))))))
 
-(def whitespace
-  (insta/parser
-    "whitespace = #'\\s+'"))
+;; ^:meta {:fields [...]} =>
+;; ^:meta [...]
 
-(def ^{:private true} parser- (insta/parser (io/resource "graphql.bnf")))
+(defn- mmove [ map ]
+  (if (not= 1 (count map))
+    map
+    (let [[k v] (first map)]
+      (assoc map k (with-meta v (meta map))))))
 
-(defn parse
-  "Parse graphql statement, hiccup format syntax tree will be return for a valid graphql statement. An instance of instaparse.gll.Failure will be return for parsing error."
-  [stmt]
-  (parser- stmt))
+;; Like merge, but moves metadata from merged maps to contained items.
+;; This allows location information to be transfered during merges.
+(defn- mmerg [ map & maps ]
+  (reduce #(conj %1 (mmove %2)) map maps))
 
-(def transformation-map
-  {;; Document
-   :Definition (fn definition [definition]
-                 (log/debug "definition: " definition)
-                 definition)
-   :Document (fn document [& args]
-               (log/debug "document: " args)
-               (let [operation-definitions  (filter #(= :operation-definition (:type %)) args) ; FIXME: assume there is only one operation-definition
-                     type-definitions (filter #(= :type-system-definition (:type %)) args)
-                     fragment-definitions (filter #(= :fragment-definition (:type %)) args)
-                     fragments (reduce (fn reduce-fragments [v fragment]
-                                         (println "fragment: " fragment)
-                                         (let [name (:fragment-name fragment)]
-                                           (println "fragment name: " name)
-                                           (assoc v name fragment)))
-                                       {} fragment-definitions)]
-                 {:operation-definitions operation-definitions
-                  :type-system-definitions type-definitions
-                  :fragments fragments}))
 
-   ;; Begin Operation Definition
-   :OperationDefinition (fn operation-definition [& args]
-                          (log/debug "operation-definition: " args)
-                          (let [definition (into {:type :operation-definition} args)]
-                            (log/debug "operation-definition: definition" definition)
-                            definition))
-   :OperationType (fn operation-type [& args]
-                    (log/debug "operation-type: args: " args)
-                    [:operation-type (into {} args)])
-   :Query (fn query [name]
-            (log/debug "Query: " name)
-            [:type name])
-   :Mutation (fn mutation [name]
-             (log/debug "Mutate: " name)
-             [:type name])
-   :SelectionSet (fn selection-set [& args]
-                   (log/debug "SelectionSet: " args)
-                   [:selection-set args])
-   :Selection (fn selection [& args]
-                (log/debug "Selection: " args)
-                (let [props (into {} args)]
-                  [:selection props]))
-   :Field (fn field [& args]
-            (log/debug "Field: " args)
-            [:field (into {} args)])
-   :Arguments (fn arguments [& args]
-                (log/debug "Arguments: " args)
-                [:arguments (into {} args)])
-   :Argument (fn argument [& args]
-               (log/debug "Argument: " args)
-               (let [m (into {} args)
-                     name (:name m)
-                     value (:value m)]
-                 [name value]))
-   :IntValue (fn int-value [v]
-               (log/debug "IntValue: " v)
-               (Integer/parseInt v))
-   :FloatValue (fn float-value [v]
-                 (log/debug "FloatValue: " v)
-                 (Double. v))
-   :StringValue (fn string-value [& args]
-                  (log/debug "StringValue: " args)
-                  (clojure.string/join (map second args)))
-   :Name (fn name [v]
-           (log/debug "Name: " v)
-           [:name v])
-   :Value (fn value [v]
-            (log/debug "Value: " v)
-            [:value v])
-   :FragmentDefinition (fn fragment-definition [& args]
-                         (log/debug "FragmentDefinition: " args)
-                         (let [definition (into {} args)
-                               fragment-name (:fragment-name definition)]
-                           (assoc definition :type :fragment-definition)))
-   :TypeCondition (fn type-condition [v]
-                    (log/debug "TypeCondition: " v)
-                    [:type-condition v])
-   :NamedType (fn named-type [v]
-                (log/debug "NamedType: " v)
-                {:named-type (second v)})
-   :FragmentName (fn fragment-name [v]
-                   (log/debug "FragmentName: " v)
-                   [:fragment-name (second v)])
-   :Directive (fn directive [& args]
-                (log/debug "Directive: " args)
-                [:directive (into {} args)])
-   :FragmentSpread (fn fragment-spread [& args]
-                     (log/debug "FragmentSpread: " args)
-                     [:fragment-spread (into {} args)])
-   :InlineFragment (fn inline-fragment [& args]
-                     (log/debug "InlineFragment: " args)
-                     [:inline-fragment (into {} args)])
+;; TODO: compare having grammar with <ignored>? (with the '?') having
+;; the ignored rule match the empty string and removing the '?' from
+;; all rules.  (e.g., performance, validity, etc...)
+(def ^:private rules
+  {:type-system-definitions   ["<ignored>? ( type-system-definition <ignored>? )*"
+                               (fn [ & defs ] {:tag :schema :type-system-definitions (vec defs)})]
 
-   ;; Begin Type System Definition
-   :TypeSystemDefinition (fn type-system-definition [definition]
-                           (log/debug "TypeSystemDefinition: " definition)
-                           (merge {:type :type-system-definition}
-                                  definition))
+   :type-system-definition    [" type-definition | interface-definition | union-definition
+                               | schema-definition | enum-definition | input-definition
+                               | directive-definition | extend-type-definition | scalar-definition"
+                               identity]
+
+   :type-definition           ["<'type'> <ignored> ident ( <ignored> implements )? <ignored>? type-fields"
+                               (fn [ident & decls] (apply merge {:tag :type-definition :name ident} decls))]
+
+   :implements                ["<'implements'> ( <ignored> basic-type-no-req )+" (fn [ & types ] {:implements types})]
+
+   ;; remove the meta data to get the line number information from the
+   ;; whole prodution instead of the sub-production.
+   :extend-type-definition    ["<'extend'> <ignored> type-definition"
+                               #(with-meta (assoc % :tag :extend-type-definition) nil)]
+
+   :interface-definition      ["<'interface'> <ignored> ident <ignored>? type-fields"
+                               #(merge {:tag :interface-definition :name %1} %2)]
+
+   :input-definition          ["<'input'> <ignored> ident <ignored>? type-fields"
+                               #(mmerg {:tag :input-definition :name %1} %2)]
+
+   ;; members are coearsed to match the result of basic-type but
+   ;; without the required.
+   :union-definition          ["<'union'> <ignored> ident <ignored>? <'='> <ignored>? basic-type-no-req ( <ignored>? <'|'> <ignored>? basic-type-no-req )*"
+                               (fn [ident & members]
+                                 {:tag :union-definition :name ident :members (vec members)})]
+
+   :schema-definition         ["<'schema'> <ignored>? <'{'> <ignored>? ( schema-type <ignored>? )* <'}'>"
+                               (fn [ & members ] {:tag :schema-definition :members (vec members)})]
+
+   :enum-definition           ["<'enum'> <ignored> ident <ignored>? <'{'> <ignored>? ( enum-constant <ignored>? )* <'}'>"
+                               (fn [ ident & constants ] {:tag :enum-definition :name ident :constants (vec constants) })]
+
+   :enum-constant             ["ident ( <ignored>? directives )?"
+                               (fn enum-constant
+                                 ([ident] {:tag :enum-constant :name ident})
+                                 ([ident directives] (merge (enum-constant ident) directives)))]
+
+   :directives                ["directive ( <ignored>? <directive> )*"
+                               (fn [ & directives ] {:directives (vec directives)})]
+
+   :directive                 ["<'@'> <ignored>? ident ( <ignored>? arguments )?"
+                               (fn directive
+                                 ([ident] {:tag :directive :name ident})
+                                 ([ident arguments] (mmerg (directive ident) arguments)))]
+
+   :directive-definition      ["<'directive'> <ignored> <'@'> <ignored>? ident ( <ignored> type-condition )?"
+                               (fn
+                                 ([ident] {:tag :directive-definition :name ident})
+                                 ([ident type-condition] {:tag :directive-definition :name ident :on (:on type-condition)}))]
+
+   :type-condition            ["<'on'> <ignored> basic-type-no-req" (fn [on] {:on on})]
+
+   :scalar-definition         ["<'scalar'> <ignored> ident"
+                               (fn[n] {:tag :scalar-definition :name n})]
+
+   :type-fields               ["<'{'> <ignored>? ( type-field <ignored>? )* <'}'>" (fn [ & fields ] {:fields (vec fields)})]
+
+   :type-field                ["ident <ignored>? ( arguments-definition <ignored>? )? <':'> <ignored>? type-ref"
+                               (fn ([ident type] {:tag :type-field :name ident :type type})
+                                  ([ident arguments type] {:tag :type-field :name ident :arguments arguments :type type}))]
+
+   :arguments-definition      ["<'('> <ignored>? ( argument-definition <ignored>? )* <')'>" vector]
+
+   :argument-definition       ["ident <ignored>? <':'> <ignored>? type-ref ( <ignored>? <'='> <ignored>? value )?"
+                               (fn ([ident type] {:tag :argument-definition :name ident :type type})
+                                  ([ident type value] {:tag :argument-definition :name ident :type type :default-value value}))]
+
+   :arguments                 ["<'('> <ignored>? ( argument <ignored>? )* <')'>" (fn [ & args ] {:arguments (vec args)})]
+
+   :argument                  ["ident <ignored>? <':'> <ignored>? value"
+                               (fn[n v] {:tag :argument :name n :value v})]
+
+   :type-ref                  ["list-type | basic-type" identity]
+
+   :list-type                 ["<'['> <ignored>? type-ref <ignored>? <']'> ( <ignored>? required )?"
+                               (fn list-type
+                                 ([t] {:tag :list-type :inner-type t})
+                                 ([t r] (assoc (list-type t) :required true)))]
+
+   :basic-type-no-req         ["ident"
+                               (fn [n] {:tag :basic-type :name n})]
+
+   :basic-type                ["ident ( <ignored>? required )?"
+                               (fn basic-type
+                                 ([n] {:tag :basic-type :name n})
+                                 ([n r] (assoc (basic-type n) :required true)))]
+
+   :required                  ["<'!'>" (constantly true)]
+
+   :schema-type               ["query-type | mutation-type | subscription-type" identity]
    
-   :InterfaceDefinition (fn interface-definition [& args]
-                          (log/debug "InterfaceDefinition: " args)
-                          (into {:type-system-type :interface} args))
-   :EnumDefinition (fn enum-definition [& args]
-                     (log/debug "EnumDefinition: args: " args)
-                     (into {:type-system-type :enum} args))
-   :TypeDefinition (fn type-definition [& args]
-                     (log/debug "TypeDefinition: args: " args)
-                     (into {:type-system-type :type} args))
-   :UnionDefinition (fn union-definition [& args]
-                      (log/debug "UnionDefinition: args: " args)
-                      (into {:type-system-type :union} args))
-   :SchemaDefinition (fn schema-definition [& args]
-                       (log/debug "SchemaDefinition: args: " args)
-                       (into {:type-system-type :schema}  args))
-   :InputDefinition (fn input-definition [& args]
-                      (log/debug "InputDefinition: args: " args)
-                      (into {:type-system-type :input} args))
-   :DirectiveDefinition (fn directive-definition [& args]
-                          (log/debug "DirectiveDefinition: args:" args)
-                          (into {:type-system-type :directive} args))
+   :query-type                ["<'query'> <ignored>? <':'> <ignored>? ident"
+                               (fn [n] {:tag :query :name n})]
+   :mutation-type             ["<'mutation'> <ignored>? <':'> <ignored>? ident"
+                               (fn [n] {:tag :mutation :name n})]
+   :subscription-type         ["<'subscription'> <ignored>? <':'> <ignored>? ident"
+                               (fn [n] {:tag :subscription :name n})]
 
-   :SchemaTypes (fn schema-types [& args]
-                  (log/debug "SchemaTypes: args: " args)
-                  [:schema-types (into {} args)])
-   :SchemaType (fn schema-type [arg]
-                 (log/debug "SchemaType: arg: " arg)
-                 arg)
-   :QueryType (fn query-type [& args]
-                (log/debug "QueryType: args: " args)
-                [:query-type (into {} args)])
-   :DirectiveName (fn directive-name [arg]
-                    (log/debug "DirectiveName: arg:" arg)
-                    arg)
-   :DirectiveOnName (fn directive-on-name [& args]
-                      (log/debug "DirectiveOnName: args: " args)
-                      [:directive-on-name (into {} args)])
-   :EnumFields (fn enum-fields [& args]
-                 (let [fields (into {} args)
-                       enum-fields (:enum-fields fields)
-                       enum-field (:enum-field fields)]
-                   (log/debug "EnumFields: args:" args)
-                   [:enum-fields (conj enum-fields enum-field)]))
-   :EnumField (fn enum-field [& args]
-                (log/debug "EnumField: args: " args)
-                [:enum-field (into {} args)])
+   :value                     ["variable-reference | float-value | int-value | boolean-value | string-value | null-value | enum-value | list-value | object-value" identity]
 
-   :TypeFields (fn type-fields [& args]
-                 (let [fields (into {} args)
-                       type-fields (:type-fields fields)
-                       type-field (:type-field fields)]
-                   (log/debug "TypeFields: args: " args)
-                   [:type-fields (conj type-fields type-field)]))
-   :TypeField (fn type-field [& args]
-                (log/debug "TypeField: args: " args)
-                [:type-field (into {} args)])
+   :variable-reference        ["<'$'> <ignored>? ident"
+                               (fn [n] {:tag :variable-reference :name n})]
 
-   :TypeFieldType (fn type-field-type [& args]
-                    (log/debug "TypeFieldType: args: " args)
-                    [:type-field-type (into {} args)])
+   :list-value                ["<'['> <ignored>? ( value <ignored>? )* <']'>"
+                               (fn [ & values ] {:tag :list-value :values (vec values)})]
 
-   :TypeFieldTypeRequired (fn type-field-type-required [arg]
-                            (log/debug "TypeFieldTypeRequired: arg: " arg)
-                            (update arg 1 merge {:required true}))
+   ;; For object-values, avoid the temptation to place fields into a
+   ;; map.  We need all fields for validation incase there are
+   ;; duplicate fields.
+   :object-value              ["<'{'> <ignored>? ( object-field <ignored>? )* <'}'>"
+                               (fn [ & fields ] {:tag :object-value :fields (vec fields)})]
 
-   :Type (fn type [arg]
-           (log/debug "Type: arg: " arg)
-           [:type arg])
+   :object-field              ["ident <ignored>? <':'> <ignored>? value"
+                               (fn [ident value] {:tag :object-field :name ident :value value})]
 
-   :TypeNames (fn type-names [& args]
-                (let [names (into {} args)
-                      type-names (:type-names names)
-                      type-name (:name names)]
-                  (log/debug "TypeNames: args: " args)
-                  [:type-names (conj type-names type-name)]))
+   :float-value               ["#'-?(?:0|[1-9]\\d*)(?:\\.\\d+(?:[eE][-+]?\\d+)?|[eE][-+]?\\d+)'"
+                               (fn [i] {:tag :float-value :image i :value (try (Double. i) (catch NumberFormatException ex))})]
 
-   :TypeFieldVariables (fn type-field-variables [& args]
-                         (let [vars (into {} args)
-                               variables (:type-field-variables vars)
-                               variable (:type-field-variable vars)]
-                           (log/debug "TypeFieldVariables: args: " args)
-                           [:type-field-variables (conj variables variable)]))
-   :TypeFieldVariable (fn type-field-variable [& args]
-                        (log/debug "TypeFieldVariable: args: " args)
-                        [:type-field-variable (into {} args)])
+   :int-value                 ["#'-?(?:0|[1-9]\\d*)(?![.eE])'" ;; use a negative lookahead to prevent matching the first part of a float
+                               (fn [i] {:tag :int-value :image i :value (try (Long/parseLong i 10) (catch NumberFormatException ex))})]
 
-   :ListTypeName (fn list-type-name [& args]
-                   (log/debug "ListTypeName: args" args)
-                   {:kind :LIST
-                    :innerType (into {} args)})
-   :NonNullType (fn non-null-type [& args]
-                  (log/debug "NonNullType: args" args)
-                  {:kind :NON_NULL
-                   :innerType (into {} args)})
+   :boolean-value             ["true-value | false-value" identity]
+
+   :enum-value                ["!(boolean-value | null-value) #'[_A-Za-z][_A-Za-z0-9]*'"
+                               (fn [i] {:tag :enum-value :image i :value (symbol i)})]
+   :true-value                ["'true'"  (fn [i] {:tag :boolean-value :image i :value true})]
+   :false-value               ["'false'" (fn [i] {:tag :boolean-value :image i :value false})]
+   :null-value                ["'null'"  (fn [i] {:tag :null-value    :image i :value nil})]
+   :string-value              ["<'\"'> #'(?:[\\t\\u0020-\\uffff&&[^\"\\\\]]|\\\\(?:[trnfb/\"\\\\]|u[0-9A-Fa-f]{4}))*' <'\"'>"
+                               (fn [i] {:tag :string-value :image i :value (unescape i)})]
+
+   :ident                     ["#'[_A-Za-z][_A-Za-z0-9]*'" symbol]
+
+   :ignored                   ["#'(?:[\\r\\n\\t\\u0020,\\ufeff]|#[\\t\\u0020-\\uffff]*)+'"
+                               (constantly nil)]
+
+   :query-document            ["<ignored>? ( ( query-definition | mutation-definition | fragment-definition | selection-set-operation ) <ignored>? )*" vector]
+
+   :selection-set-operation   ["selection-set" #(assoc % :tag :selection-set)]
+
+   :query-definition          ["<'query'> ( <ignored> ident )? <ignored>? operation-rest"
+                               (fn ([oprest] (mmerg {:tag :query-definition} oprest))
+                                 ([name oprest] (mmerg {:tag :query-definition :name name} oprest)))]
+                                ;; (fn ([op] (assoc op :tag :query))
+                                ;;   ([name op] (assoc op :tag :query :name name)))]
+
+   :mutation-definition       ["<'mutation'> ( <ignored> ident )? <ignored>? operation-rest"
+                                (fn ([op] (mmerg {:tag :mutation} op))
+                                  ([name op] (mmerg {:tag :mutation :name name} op)))]
+
+   :operation-rest            ["( variable-definitions <ignored>? )? ( directives <ignored>? )? selection-set"
+                                (fn [ & parts ] (apply merge parts))]
+
+   :fragment-definition       ["<'fragment'> <ignored> ident <ignored> ( type-condition <ignored>? )? ( directives <ignored>? )? selection-set"
+                                (fn [name & rest] (apply mmerg {:tag :fragment-definition :name name} rest))]
+
+   :variable-definitions      ["<'('> <ignored>? ( variable-definition <ignored>? )* <')'>"
+                                (fn [ & defs ] {:variable-definitions (vec defs)})]
+
+   :variable-definition       ["<'$'> <ignored>? ident <ignored>? <':'> <ignored>? type-ref ( <ignored>? <'='> <ignored>? value )?"
+                                (fn ([name type] {:tag :variable-definition :name name :type type})
+                                  ([name type value] {:tag :variable-definition :name name :type type :default-value value}))]
+
+   :selection-set             ["<'{'> <ignored>? ( selection <ignored>? )* <'}'>"
+                                (fn [ & selection ] {:selection-set (vec selection)})]
+
+   :selection                 ["aliased-field | selection-field | fragment-spread | inline-fragment" identity]
+
+   :aliased-field             ["ident <ignored>? <':'> <ignored>? selection-field"
+                                (fn [ alias field ] (mmerg {:alias alias} field))]
+
+   :selection-field           ["ident ( <ignored>? arguments )? ( <ignored>? directives )? ( <ignored>? selection-set )?"
+                                (fn [ name & rest ] (apply mmerg {:tag :selection-field :name name} rest))]
+
+   :fragment-spread           ["<'...'> <ignored>? ident ( <ignored>? directives )?"
+                                (fn ([name] {:tag :fragment-spread :name name})
+                                  ([name directives] (mmerg {:tag :fragment-spread :name name} directives)))]
+
+   :inline-fragment           ["<'...'> <ignored>? ( type-condition <ignored>? )? ( directives <ignored> )? selection-set"
+                                (fn [ & args ] (apply mmerg {:tag :inline-fragment} args))]
    })
 
-(defn transform
-  "Transform parsed syntax tree for execution."
-  [parse-tree]
-  (insta/transform
-   transformation-map
-   parse-tree))
+(defn- production-refs [production]
+  (for [[_ t] (re-seq #"'(?:[^']|\\.)*'|([a-zA-Z][-_a-zA-Z0-9]*)" production) :when t]
+    (keyword t)))
 
-(comment
-  ;; Sample expressions
-  (parse "query {user}")
-  (parse "query {user {id}}")
-  (transform (parse "query {user {id}}"))
-  (transform (parse "type Person {
-  name: String
-  age: Int
-  picture: Url
+(defn- collect-rules [rules-map rule]
+  (loop [set #{rule} q (conj clojure.lang.PersistentQueue/EMPTY rule)]
+    (if (empty? q) (into [rule] (disj set rule))
+        (let [prods (into #{} (production-refs (first (rules-map (peek q)))))]
+          (recur (into set prods) (into (pop q) (set/difference prods set)))))))
+
+(defn- build-parser [rules-map primary]
+  (let [rules (collect-rules rules-map primary)
+        parser (insta/parser (str/join "\n" (map #(str (name %) " := " (first (rules-map %))) rules)))
+        tfmap (reduce #(if-let [tf (second (rules-map %2))] (assoc %1 %2 tf) %1) {} rules)]
+    #(->> (parser %)
+          (insta/add-line-and-column-info-to-metadata %)
+          (insta/transform tfmap))))
+
+(def orig-parse-schema-fn (build-parser rules :type-system-definitions))
+(def orig-parse-query-document-fn (build-parser rules :query-document))
+
+(defn- insta-failure->error
+  [message failure]
+  {:message "Failed parsing schema!"
+   :locations [{:line (:line failure)
+                :column (:column failure)
+                :index (:index failure)}]})
+
+(defn orig-parse-schema
+  [^String input]
+  (let [result (orig-parse-schema-fn input)]
+    (if (insta/failure? result)
+      (throw (ex-info "Failed parsing schema." {:errors [(insta-failure->error "Failed parsing schema." result)]}))
+      result)))
+
+(defn orig-parse-query-document
+  [^String input]
+  (let [result (orig-parse-query-document-fn input)]
+    (if (insta/failure? result)
+      (throw (ex-info "Failed parsing query document." {:errors [(insta-failure->error "Failed parsing query document." result)]}))
+      result)))
+
+(defn- parse-exception->error
+  [e]
+  (if e
+    (let [location (.location e)]
+      {:message (.getMessage e)
+       :locations [{:line (:line location)
+                    :column (:column location)
+                    :index (:index location)}]})))
+
+(defn parse-schema [^String input]
+  (try
+    (.parseSchema (Parser. input))
+    (catch ParseException e
+      (throw (ex-info "Failed parse schema." {:errors [(parse-exception->error e)]})))))
+
+(defn parse-query-document [^String input]
+  (try
+    (.parseQueryDocument (Parser. input))
+    (catch ParseException e
+      (throw (ex-info "Failed parse query document." {:errors [(parse-exception->error e)]})))))
+
+(def ^:private example-schema
+"enum DogCommand { SIT, DOWN, HEEL }
+
+type Dog implements Pet {
+  name: String!
+  nickname: String
+  barkVolume: Int
+  doesKnowCommand(dogCommand: DogCommand!): Boolean!
+  isHousetrained(atOtherHomes: Boolean): Boolean!
+  owner: Human
 }
-")))
+
+interface Sentient {
+  name: String!
+}
+
+interface Pet {
+  name: String!
+}
+
+type Alien implements Sentient {
+  name: String!
+  homePlanet: String
+}
+
+type Human implements Sentient {
+  name: String!
+}
+
+enum CatCommand { JUMP }
+
+type Cat implements Pet {
+  name: String!
+  nickname: String
+  doesKnowCommand(catCommand: CatCommand!): Boolean!
+  meowVolume: Int
+}
+
+union CatOrDog = Cat | Dog
+union DogOrHuman = Dog | Human
+union HumanOrAlien = Human | Alien
+
+type Arguments {
+  multipleReqs(x: Int!, y: Int!): Int!
+  booleanArgField(booleanArg: Boolean): Boolean
+  floatArgField(floatArg: Float): Float
+  intArgField(intArg: Int): Int
+  nonNullBooleanArgField(nonNullBooleanArg: Boolean!): Boolean!
+  nonNullListOfBooleanField(nonNullListOfBooleanArg: [Boolean]!) : Boolean!
+  listOfNonNullBooleanField(listOfNonNullBooleanArg: [Boolean!]) : Boolean!
+  nonNullListOfNonNullBooleanField(nonNullListOfNonNullBooleanArg: [Boolean!]!) : Boolean!
+  booleanListArgField(booleanListArg: [Boolean]!): [Boolean]
+}
+
+type QueryRoot {
+  dog: Dog
+  arguments: Arguments
+}
+
+type MutationRoot {
+  dog: Dog
+  arguments: Arguments
+}
+
+schema {
+  query: QueryRoot
+  mutation: MutationRoot
+}")
+
+
+;; for benchmarking, performs a gc and waits for an object to be collected.
+(defn- gc []
+  (let [rq (java.lang.ref.ReferenceQueue.)
+        ref (java.lang.ref.WeakReference. (Object.) rq)]
+    (System/gc)
+    (if-let [r (.remove rq 5000)]
+      (assert (identical? r ref))
+      (println "GC timeout"))))
+  
+(defn -main [ & args ]
+  (set! *warn-on-reflection* true)
+  (dotimes [_ 10] ;; run a few iterations to allow JIT
+    ;;(println "===")
+    ;;(print "Orig: ") ;; 2187 msecs
+    ;; (time (dotimes [_ 100] (orig-parse-schema example-schema)))
+    (gc)
+    (print "Java: ") ;; ~3.5 msecs (~51 msecs before JIT)
+    (time (dotimes [_ 100] (parse-schema example-schema)))))
+

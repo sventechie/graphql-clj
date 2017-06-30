@@ -1,486 +1,218 @@
 (ns graphql-clj.parser-test
   (:require [clojure.test :refer :all]
-            [graphql-clj.parser :refer :all]))
+            [instaparse.core :as insta]
+            [graphql-clj.parser :as parser]
+            [yaml.core :as yaml]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.pprint :refer [pprint]])
+  (:import [java.io File]
+           [graphql_clj Parser ParseException]))`>
 
-(def test-statements
-  [
-   "query {
-  user(id: 4) {
-    id
-    name
-    profilePic(width: 100, height: 50.0)
-  }
-}
-"
-   
-   "query {
-  user(id: 4) {
-    id
-    name
-    profilePic(width: 100, height: 50)
-  }
-}"
+(defn- local-resource [^String src]
+  (-> local-resource .getClass (.getResource src) .getPath File.))
 
-   "{
-  user(id: 4) {
-    name
-  }
-}"
+(defmacro def-file-tests [dir-name bindings & body]
+  (let [dir (local-resource dir-name) ext (nth bindings 1)]
+    (vec (for [file (.list dir) :when (str/ends-with? file ext) :let [name (str/replace file #"\..*$" "")]]
+           `(deftest ~(symbol name)
+              (let ~(->> (partition 2 bindings)
+                         (reduce (fn [s [k v]] (conj s k `(File. ~(.toString (File. dir (str name v)))))) []))
+                ~@body))))))
 
-   "mutation {
-  likeStory(storyID: 12345) {
-    story {
-      likeCount
-    }
-  }
-}"
+(defn- fail [count path actual expected fmt & args]
+  (do-report {:type :fail
+              :actual actual
+              :expected expected
+              :message (str "At " (if (empty? path) "{root}" (str/join "/" path)) ": " (apply format fmt args))})
+  (inc count))
 
-   "{
-  me {
-    id
-    firstName
-    lastName
-    birthday {
-      month
-      day
-    }
-    friends {
-      name
-    }
-  }
-}"
 
-   "# `me` could represent the currently logged in viewer.
-{
-  me {
-    name
-  }
-}
-"
+(declare assert-tree)
+(defn- assert-meta [count path actual expected]
+  (let [em (meta expected) am (meta actual)]
+    (cond (and em am) (assert-tree count (conj path "^") am em)
+          em (fail count path am em "Expected meta data")
+          am (fail count path am em "Unexpected meta data")
+          :else count)))
 
-   "# `me` could represent the currently logged in viewer.
-{
-  me {
-    name
-  }
-}
+(defn- assert-tree
+  ([actual expected] (assert-tree 0 [] actual expected))
+  ([count path actual expected]
+   (let [count (assert-meta count path actual expected)]
+     (cond
+       (map? expected)
+       (if-not (map? actual)
+         (fail count path "not a map" "a map" "type-mismatch")
+         (letfn [(check-actual [count k]
+                   (if (contains? actual k)
+                     (assert-tree count (conj path k) (actual k) (expected k))
+                     (fail count path (actual k) (expected k) "Missing key '%s'" k)))
+                 (check-expected [count k]
+                   (if (contains? expected k)
+                     count
+                     (fail count path (actual k) (expected k) "Extra key '%s'" k)))]
+           (let [count (reduce check-expected count (keys expected))]
+             (reduce check-actual count (keys actual)))))
+    
+       (sequential? expected)
+       (if-not (sequential? actual)
+         (fail count path "not a sequence" "a sequence" "type-mismatch")
+         (loop [count count a actual e expected i 0]
+           (cond
+             (empty? a)
+             (if-not (empty? e)
+               (fail count path nil (first e) "Missing element at index %d" i)
+               count)
+             
+             (empty? e)
+             (fail count path (first a) nil "Extra elements at index %d" i)
+             
+             :else
+             (recur (assert-tree count (conj path i) (first a) (first e))
+                    (rest a) (rest e) (inc i)))))
 
-# `user` represents one of many users in a graph of data, referred to by a
-# unique identifier.
-{
-  user(id: 4) {
-    name
-  }
-}"
+       :else
+       (if-not (= actual expected)
+         (fail count path actual expected "data mismatch")
+         count)))))
 
-   "{
-  user(id: 4) {
-    id
-    name
-    profilePic(size: 100)
-  }
-}
-"
-   "{
-  user(id: 4) {
-    id
-    name
-    profilePic(width: 100, height: 50)
-  }
-}
-"
+(def ^:private first-keys [:tag :name :type])
+(def ^:private first-key-set (into #{} first-keys))
 
-   ;; In this example, we can fetch two profile pictures of different sizes and ensure the resulting object will not have duplicate keys:
-   "{
-  user(id: 4) {
-    id
-    name
-    smallPic: profilePic(size: 64)
-    bigPic: profilePic(size: 1024)
-  }
-}
-"
+(defn- kv-order
+  "pprint-edn helper function that returns a map's key-value pairs in
+  the following order: all non-collection values appear first,
+  followed by all collection values.  Within each group, the keys are
+  sorted such that keys in 'first-keys' appear first, and the rest
+  appear alphabetically."
+  [obj]
+  (let [k (apply sorted-set (keys obj))
+        k (->> (concat (filter k first-keys) (remove first-key-set k))
+               (group-by #(coll? (obj %))))]
+    (->> (concat (k false) (k true))
+         (map #(vector % (obj %))))))
 
-   ;; Since the top level of a query is a field, it also can be given an alias:
-   "{
-  zuck: user(id: 4) {
-    id
-    name
-  }
-}
-"
+(defn- simple-map? [obj] (and (map? obj) (not-any? coll? (vals obj))))
 
-   ;; Fragments allow for the reuse of common repeated selections of fields, reducing duplicated text in the document. Inline Fragments can be used directly within a selection to condition upon a type condition when querying against an interface or union.
-   
-   ;; For example, if we wanted to fetch some common information about mutual friends as well as friends of some user:
-   "query noFragments {
-  user(id: 4) {
-    friends(first: 10) {
-      id
-      name
-      profilePic(size: 50)
-    }
-    mutualFriends(first: 10) {
-      id
-      name
-      profilePic(size: 50)
-    }
-  }
-}"
+(defn- convert-loc [{s :start e :end}]
+  {:start [(:line s) (:column s) (:index s)]
+   :end [(:line e) (:column e) (:index e)]})
+  ;; {:start [(:instaparse.gll/start-line m)
+  ;;          (:instaparse.gll/start-column m)
+  ;;          (:instaparse.gll/start-index m)]
+  ;;  :end [(:instaparse.gll/end-line m)
+  ;;        (:instaparse.gll/end-column m)
+  ;;        (:instaparse.gll/end-index m)]})
 
-   ;; The repeated fields could be extracted into a fragment and composed by a parent fragment or query.
-   "query withFragments {
-  user(id: 4) {
-    friends(first: 10) {
-      ...friendFields
-    }
-    mutualFriends(first: 10) {
-      ...friendFields
-    }
-  }
-}
+(defn- simplify-location-meta [obj]
+  (let [r (cond (map? obj) (into {} (map simplify-location-meta) obj)
+                (coll? obj) (into [] (map simplify-location-meta) obj)
+                :else obj)]
+    (if-let [m (meta obj)] (with-meta r (convert-loc m)) r)))
 
-fragment friendFields on User {
-  id
-  name
-  profilePic(size: 50)
-}
-"
+(defn- remove-ns-from [obj]
+  (let [r (cond (map? obj) (into {} (map remove-ns-from obj))
+                (coll? obj) (into [] (map remove-ns-from obj))
+                (keyword? obj) (keyword (name obj))
+                (symbol? obj) (symbol (name obj))
+                :else obj)]
+    (if-let [m (meta obj)] (with-meta r (remove-ns-from m)) r)))
+        
+(defn- pprint-edn
+  ([obj] (pprint-edn "" obj))
+  ([indent obj]
+   (let [subi (str indent " ")]
+     (str (if-let [m (meta obj)] (str "^" (pr-str m) (if (coll? obj) (str "\n" indent) " ") ""))
+          (cond
+            (map? obj)
+            (str "{"
+                 (->> (for [[k v] (kv-order obj)]
+                        (str (pr-str k) (if (coll? v) (str "\n" subi) " ") (pprint-edn subi v)))
+                      (str/join (str "\n" subi)))
+                 "}")
+            
+            (sequential? obj)
+            (str "[" (str/join (str "\n" subi) (map #(pprint-edn subi %) obj)) "]")
+        
+            :else
+            (pr-str obj))))))
+    
 
-   ;; Fragments are consumed by using the spread operator (...). All fields selected by the fragment will be added to the query field selection at the same level as the fragment invocation. This happens through multiple levels of fragment spreads.
+(def-file-tests "parser_test"
+  [in ".input" expected ".expected.edn" actual-file ".actual.edn"]
+  (let [input (slurp in :encoding "UTF-8")
+        expect (if (.exists expected) (edn/read-string (slurp expected :encoding "UTF-8")))
+        actual (-> (case (str/replace (.getName in) #"-.*$" "")
+                     "schema" (parser/parse-schema input)
+                     "query" (parser/parse-query-document input))
+                   (simplify-location-meta))]
+    (when (or (> (assert-tree actual expect) 0)
+              (not= actual expect))
+      (printf "Writing parsed AST to '%s'%n" actual-file)
+      (spit actual-file (pprint-edn actual) :encoding "UTF-8")
+      (do-report {:type :fail
+                  :actual actual
+                  :expected expect}))))
 
-   ;; For example:
-   "query withNestedFragments {
-  user(id: 4) {
-    friends(first: 10) {
-      ...friendFields
-    }
-    mutualFriends(first: 10) {
-      ...friendFields
-    }
-  }
-}
+(testing "primitive value tokenization"
+  (are [input expect] (= (assoc expect :image input) (.parseValue (Parser. input)))
+       "0" {:tag :int-value :value 0}
+       "1" {:tag :int-value :value 1}
+       "-2" {:tag :int-value :value -2}
+       "34" {:tag :int-value :value 34}
+       "1.2" {:tag :float-value :value 1.2}
+       "1e3" {:tag :float-value :value 1e3}
+       "1E3" {:tag :float-value :value 1e3}
+       "1e+3" {:tag :float-value :value 1e3}
+       "1e-3" {:tag :float-value :value 1e-3}
+       "1.2e3" {:tag :float-value :value 1.2e3}
+       "1.2E3" {:tag :float-value :value 1.2e3}
+       "1.2e+3" {:tag :float-value :value 1.2e3}
+       "1.2e-3" {:tag :float-value :value 1.2e-3}
+       "\"\"" {:tag :string-value :value ""}
+       "\"hello\"" {:tag :string-value :value "hello"}
+       "\"\\\\,\\\",\\/,\\r,\\n,\\t,\\f,\\b\"" {:tag :string-value :value "\\,\",/,\r,\n,\t,\f,\b"}
+       "\"\\u00a0\\u201C\"" {:tag :string-value :value "\u00a0\u201C"}
+       "true" {:tag :boolean-value :value true}
+       "false" {:tag :boolean-value :value false}
+       "null" {:tag :null-value :value nil}
+       "c" {:tag :enum-value :value 'c}))
 
-fragment friendFields on User {
-  id
-  name
-  ...standardProfilePic
-}
+(testing "tokenization errors"
+  (are [input expect] (= expect (try (.parseValue (Parser. input))
+                                     nil
+                                     (catch ParseException ex
+                                       {:loc (.location ex) :msg (.getMessage ex)})))
+       ;; '-' must be followed by a digit, test non-digit and EOF
+       "- "  {:loc {:line 1 :column 2 :index 1} :msg "expected digit after '-'"}
+       "-"   {:loc {:line 1 :column 2 :index 1} :msg "expected digit after '-'"}
+       ;; According to spec, 0-prefixed numbers are not allowed, and -0 is.
+       "01"  {:loc {:line 1 :column 2 :index 1} :msg "zero-prefixed numbers are not allowed"}
+       "-01" {:loc {:line 1 :column 3 :index 2} :msg "zero-prefixed numbers are not allowed"}
+       ;; Decimal must be followed by at least 1 digit, test non-digit and EOF
+       "2. " {:loc {:line 1 :column 3 :index 2} :msg "expected digit after '.'"}
+       "2."  {:loc {:line 1 :column 3 :index 2} :msg "expected digit after '.'"}
+       "0. " {:loc {:line 1 :column 3 :index 2} :msg "expected digit after '.'"}
+       ;; Exponent must be followed by at least 1 digit, or '+' or '-' and a digit
+       "3e " {:loc {:line 1 :column 3 :index 2} :msg "expected digit after 'e'"}
+       "3e"  {:loc {:line 1 :column 3 :index 2} :msg "expected digit after 'e'"}
+       "0e " {:loc {:line 1 :column 3 :index 2} :msg "expected digit after 'e'"}
+       "3E " {:loc {:line 1 :column 3 :index 2} :msg "expected digit after 'e'"}
+       "3e+ " {:loc {:line 1 :column 4 :index 3} :msg "expected digit after 'e'"}
+       "3e+"  {:loc {:line 1 :column 4 :index 3} :msg "expected digit after 'e'"}
+       "3E- " {:loc {:line 1 :column 4 :index 3} :msg "expected digit after 'e'"}
+       "4.5e " {:loc {:line 1 :column 5 :index 4} :msg "expected digit after 'e'"}
+       ;; Floats must start with an integer component, cannot just be the fractional component
+       ".123" {:loc {:line 1 :column 1 :index 0} :msg "invalid character sequence, did you mean '...'?"}
+       ;; Some characters are not allowed in the stream
+       "\u0001" {:loc {:line 1 :column 1 :index 0} :msg "invalid character U+0001"}
+       ;; EOF conditions in strings
+       "\"x" {:loc {:line 1 :column 3 :index 2} :msg "unterminated string"}
+       "\"\\" {:loc {:line 1 :column 3 :index 2} :msg "unterminated string"}
+       "\"\\u123" {:loc {:line 1 :column 4 :index 3} :msg "unterminated string"}
+       ;; Invalid characters in strings and escape sequences therein
+       "\"x\n\"" {:loc {:line 1 :column 4 :index 3} :msg "invalid character in string"}
+       "\"\\x1234\"" {:loc {:line 1 :column 4 :index 3} :msg "invalid escape sequence"}
+       "\"\\uEFGH\"" {:loc {:line 1 :column 7 :index 6} :msg "invalid hex escape"}))
 
-fragment standardProfilePic on User {
-  profilePic(size: 50)
-}
-"
-
-   "query FragmentTyping {
-  profiles(handles: [\"zuck\", \"cocacola\"]) {
-    handle
-    ...userFragment
-    ...pageFragment
-  }
-}
-
-fragment userFragment on User {
-  friends {
-    count
-  }
-}
-
-fragment pageFragment on Page {
-  likers {
-    count
-  }
-}"
-
-   "query inlineFragmentTyping {
-  profiles(handles: [\"zuck\", \"cocacola\"]) {
-    handle
-    ... on User {
-      friends {
-        count
-      }
-    }
-    ... on Page {
-      likers {
-        count
-      }
-    }
-  }
-}"
-
-   "query inlineFragmentNoType($expandedInfo: Boolean) {
-  user(handle: \"zuck\") {
-    id
-    name
-    ... @include(if: $expandedInfo) {
-      firstName
-      lastName
-      birthday
-    }
-  }
-}"
-
-   "query getZuckProfile($devicePicSize: Int) {
-  user(id: 4) {
-    id
-    name
-    profilePic(size: $devicePicSize)
-  }
-}"
-
-   "query hasConditionalFragment($condition: Boolean) {
-  ...maybeFragment @include(if: $condition)
-}
-
-fragment maybeFragment on Query {
-  me {
-    name
-  }
-}"
-
-   "query hasConditionalFragment($condition: Boolean) {
-  ...maybeFragment
-}
-
-fragment maybeFragment on Query @include(if: $condition) {
-  me {
-    name
-  }
-}"
-
-   "query myQuery($someTest: Boolean) {
-  experimentalField @skip(if: $someTest)
-}"
-
-   "mutation setName {
-  setName(name: \"Zuck\") {
-    newName
-  }
-}"
-   
-])
-
-(deftest test-parse
-  (testing "Test all statements parsing"
-    (doseq [statement test-statements]
-      (is (not (nil? (parse statement)))))))
-
-(deftest test-transform
-  (testing "Test statement transforming"
-    (doseq [statement test-statements]
-      (is (not (nil? (transform (parse statement))))))))
-
-(def test-schemas
-  ["
-type Person {
-  name: String
-  age: Int
-  picture: Url
-}
-"
-   "
-type Person {
-  name(id: ID): String
-  age: Int
-  picture: Url
-}"
-   "
-type Person {
-  name(id: ID id2: ID): String
-  age: Int
-  picture: Url
-}"
-   "
-type Person {
-  name: String
-  age: Int
-}
-
-type Photo {
-  height: Int
-  width: Int
-}
-"
-   "
-type Person {
-  name: String
-  age: Int
-}
-
-type Photo {
-  height: Int
-  width: Int
-}
-
-type SearchQuery {
-  firstSearchResult: SearchResult
-}"
-   "
-type Person {
-  name: String
-  age: Int
-  picture: Url
-  relationship: Person
-}"
-   "
-interface NamedEntity {
-  name: String
-}
-
-type Person implements NamedEntity {
-  name: String
-  age: Int
-}
-
-type Business implements NamedEntity {
-  name: String
-  employeeCount: Int
-}"
-   "
-union SearchResult = Photo | Person
-
-type Person {
-  name: String
-  age: Int
-}
-
-type Photo {
-  height: Int
-  width: Int
-}
-
-type SearchQuery {
-  firstSearchResult: SearchResult
-}"
-   
-   "
-interface Being {
- name: String
-}
-
-interface Pet {
-  name: String
-}
-
-interface Canine {
-  name(surname: Boolean): String
-}
-
-enum DogCommand {
-  SIT @enumInt(value: 0)
-  HEEL @enumInt(value: 1)
-  DOWN @enumInt(value: 2)
-}
-
-enum FurColor {
-  BROWN @enumInt(value: 0)
-  BLACK @enumInt(value: 1)
-  TAN @enumInt(value: 2)
-  SPOTTED @enumInt(value: 3)
-}
-
-type Dog implements Being, Pet, Canine {
-  name(surname: Boolean): String
-  nickname: String
-  barks: Boolean
-  barkVolume: Int
-  doesKnowCommand(dogCommand: DogCommand): Boolean
-  isHousetrained(atOtherHomes: Boolean = true): Boolean
-  isAtLocation(x: Int, y: Int): Boolean
-}
-
-type Cat implements Being, Pet {
-  name: String
-  nickname: String
-  meows: Boolean
-  meowVolume: Int
-  furColor: FurColor
-}
-
-union CatOrDog = Dog | Cat
-
-interface Intelligent {
-  iq: Int
-}
-
-type Human implements Being, Intelligent {
-  name(surname: Boolean): String
-  pets: [Pet]
-  relatives: [Human]
-  iq: Int
-}
-
-type Alien implements Being, Intelligent {
-  name(surname: Boolean): String
-  iq: Int
-  numEyes: Int
-}
-
-union DogOrHuman = Dog | Human
-
-union HumanOrAlien = Human | Alien
-
-input ComplexInput {
-  requiredField: Boolean!
-  intField: Int
-  stringField: String
-  booleanField: Boolean
-  stringListField: [String]
-}
-
-type ComplicatedArgs {
-  intArgField(intArg: Int): String
-  nonNullIntArgField(nonNullIntArg: Int!): String
-  stringArgField(stringArg: String): String
-  booleanArgField(booleanArg: Boolean): String
-  enumArgField(enumArg: FurColor): String
-  floatArgField(floatArg: Float): String
-  idArgField(idArg: ID): String
-  stringListArgField(stringListArg: [String]): String
-  complexArgField(complexArg: ComplexInput): String
-  multipleReqs(req1: Int!, req2: Int!): String
-  multipleOpts(opt1: Int, opt2: Int): String
-  multipleOptAndReq(req1: Int!, req2: Int!, opt1: Int, opt2: Int): String
-}
-
-type QueryRoot {
-  human(id: ID): Human
-  alien: Alien
-  dog: Dog
-  cat: Cat
-  pet: Pet
-  catOrDog: CatOrDog
-  dogOrHuman: DogOrHuman
-  humanOrAlien: HumanOrAlien
-  complicatedArgs: ComplicatedArgs
-}
-
-directive @onQuery on QUERY
-directive @onMutation on MUTATION
-directive @onSubscription on SUBSCRIPTION
-directive @onField on FIELD
-directive @onFragmentDefinition on FRAGMENT_DEFINITION
-directive @onFragmentSpread on FRAGMENT_SPREAD
-directive @onInlineFragment on INLINE_FRAGMENT
-directive @onSchema on SCHEMA
-directive @onScalar on SCALAR
-directive @onObject on OBJECT
-directive @onFieldDefinition on FIELD_DEFINITION
-directive @onArgumentDefinition on ARGUMENT_DEFINITION
-directive @onInterface on INTERFACE
-directive @onUnion on UNION
-directive @onEnum on ENUM
-directive @onEnumValue on ENUM_VALUE
-directive @onInputObject on INPUT_OBJECT
-directive @onInputFieldDefinition on INPUT_FIELD_DEFINITION
-
-schema {
-  query: QueryRoot
-}
-"])
-
-(deftest test-schema
-  (doseq [schema test-schemas]
-    (testing "Test schema parsing and transforming"
-      (is (not (nil? (parse schema))))
-      (is (not (nil? (transform (parse schema))))))))
